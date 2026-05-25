@@ -116,6 +116,12 @@ def run_backfill_pipeline(start_date: str, end_date: str) -> None:
     feature_df = build_feature_dataframe(raw_df)
     logger.info("Computed %d features × %d rows", len(feature_df.columns), len(feature_df))
 
+    # Save a local copy to bypass Hopsworks cluster overload if needed
+    import os
+    os.makedirs("data", exist_ok=True)
+    feature_df.to_csv("data/karachi_aqi_features.csv", index=False)
+    logger.info("Successfully saved local cache of features to 'data/karachi_aqi_features.csv'")
+
     # Step 3: Insert into Hopsworks (in batches if very large)
     logger.info("Step 3/3: Connecting to Hopsworks and inserting features...")
     project = get_hopsworks_project()

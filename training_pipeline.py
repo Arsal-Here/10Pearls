@@ -286,17 +286,34 @@ def main() -> None:
     logger.info("=" * 60)
 
     # Step 1: Connect to Hopsworks and pull data
-    logger.info("Step 1/5: Connecting to Hopsworks...")
-    project = get_hopsworks_project()
-    fs = get_feature_store(project)
+    df = None
 
-    # Get feature group first (needed for feature view creation)
-    fg = fs.get_feature_group(name="karachi_aqi_features", version=1)
-    fv = get_or_create_feature_view(fs, fg)
+    # Check if local data cache is available
+    local_cache_path = "data/karachi_aqi_features.csv"
+    if os.path.exists(local_cache_path):
+        logger.info("Local data cache found! Loading '%s'...", local_cache_path)
+        try:
+            df = pd.read_csv(local_cache_path)
+            logger.info("Successfully loaded %d rows from local cache", len(df))
+        except Exception as e:
+            logger.error("Failed to load local cache: %s. Will try Hopsworks instead.", e)
 
-    logger.info("Step 2/5: Pulling training data from Feature Store...")
-    df = get_training_data(fv)
-    logger.info("Retrieved %d rows × %d columns", len(df), len(df.columns))
+    if df is None:
+        logger.info("Step 1/5: Connecting to Hopsworks...")
+        try:
+            project = get_hopsworks_project()
+            fs = get_feature_store(project)
+
+            # Get feature group first (needed for feature view creation)
+            fg = fs.get_feature_group(name="karachi_aqi_features", version=1)
+            fv = get_or_create_feature_view(fs, fg)
+
+            logger.info("Step 2/5: Pulling training data from Feature Store...")
+            df = get_training_data(fv)
+            logger.info("Retrieved %d rows × %d columns", len(df), len(df.columns))
+        except Exception as exc:
+            logger.error("Failed to connect/pull from Hopsworks: %s", exc)
+            raise RuntimeError("Unable to get training data from Hopsworks and no valid local cache exists.")
 
     # Step 2: Train models for each target horizon
     all_best_models = {}
@@ -340,21 +357,32 @@ def main() -> None:
     logger.info("\nStep 3/5: Saving model artifacts...")
 
     model_dir = tempfile.mkdtemp(prefix="karachi_aqi_model_")
+    local_models_dir = "models"
+    os.makedirs(local_models_dir, exist_ok=True)
 
     for target_col, model_info in all_best_models.items():
         model_path = os.path.join(model_dir, f"model_{target_col}.joblib")
         joblib.dump(model_info["model"], model_path)
-        logger.info("Saved %s → %s", target_col, model_path)
+        
+        local_model_path = os.path.join(local_models_dir, f"model_{target_col}.joblib")
+        joblib.dump(model_info["model"], local_model_path)
+        logger.info("Saved %s → %s and %s", target_col, model_path, local_model_path)
 
         # Save feature names for inference
         features_path = os.path.join(model_dir, f"features_{target_col}.joblib")
         joblib.dump(model_info["feature_names"], features_path)
+        
+        local_features_path = os.path.join(local_models_dir, f"features_{target_col}.joblib")
+        joblib.dump(model_info["feature_names"], local_features_path)
 
     # Save feature importance
     if not combined_fi.empty:
         fi_path = os.path.join(model_dir, "feature_importance.csv")
         combined_fi.to_csv(fi_path, index=False)
-        logger.info("Saved feature importance → %s", fi_path)
+        
+        local_fi_path = os.path.join(local_models_dir, "feature_importance.csv")
+        combined_fi.to_csv(local_fi_path, index=False)
+        logger.info("Saved feature importance → %s and %s", fi_path, local_fi_path)
 
     # Save model metadata
     metadata = {
@@ -370,35 +398,41 @@ def main() -> None:
     }
     metadata_path = os.path.join(model_dir, "metadata.joblib")
     joblib.dump(metadata, metadata_path)
-    logger.info("Saved metadata → %s", metadata_path)
+    
+    local_metadata_path = os.path.join(local_models_dir, "metadata.joblib")
+    joblib.dump(metadata, local_metadata_path)
+    logger.info("Saved metadata → %s and %s", metadata_path, local_metadata_path)
 
     # Step 4: Register in Hopsworks Model Registry
     logger.info("Step 4/5: Registering model in Hopsworks Model Registry...")
-    mr = get_model_registry(project)
+    try:
+        mr = get_model_registry(project)
 
-    # Use the 24h target metrics as the primary model metrics
-    primary_metrics = all_best_metrics.get(
-        "aqi_target_24h",
-        next(iter(all_best_metrics.values())),
-    )
+        # Use the 24h target metrics as the primary model metrics
+        primary_metrics = all_best_metrics.get(
+            "aqi_target_24h",
+            next(iter(all_best_metrics.values())),
+        )
 
-    primary_model_name = all_best_models.get(
-        "aqi_target_24h", next(iter(all_best_models.values()))
-    )["name"]
+        primary_model_name = all_best_models.get(
+            "aqi_target_24h", next(iter(all_best_models.values()))
+        )["name"]
 
-    description = (
-        f"Karachi AQI multi-horizon prediction model. "
-        f"Best algorithm: {primary_model_name}. "
-        f"Targets: {', '.join(TARGET_COLS)}. "
-        f"Trained on {len(df)} rows with {len(feature_names)} features."
-    )
+        description = (
+            f"Karachi AQI multi-horizon prediction model. "
+            f"Best algorithm: {primary_model_name}. "
+            f"Targets: {', '.join(TARGET_COLS)}. "
+            f"Trained on {len(df)} rows with {len(feature_names)} features."
+        )
 
-    register_model(
-        mr=mr,
-        model_dir=model_dir,
-        metrics=primary_metrics,
-        description=description,
-    )
+        register_model(
+            mr=mr,
+            model_dir=model_dir,
+            metrics=primary_metrics,
+            description=description,
+        )
+    except Exception as exc:
+        logger.warning("Could not register model in Hopsworks Model Registry: %s. Operating completely offline with local model files.", exc)
 
     # Step 5: Summary
     logger.info("\n" + "=" * 60)

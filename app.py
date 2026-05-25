@@ -248,10 +248,8 @@ st.markdown("""
         color: #00f5d4;
     }
 
-    /* Hide Streamlit branding */
-    #MainMenu {visibility: hidden;}
+    /* Hide Streamlit footer branding only */
     footer {visibility: hidden;}
-    header {visibility: hidden;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -260,9 +258,12 @@ st.markdown("""
 # Caching & Data Loading
 # ---------------------------------------------------------------------------
 
-@st.cache_resource(ttl=3600, show_spinner="Connecting to Hopsworks...")
+@st.cache_resource(ttl=3600, show_spinner="Loading trained models...")
 def load_model_from_registry():
-    """Load the trained model from Hopsworks Model Registry."""
+    """Load the trained model from Hopsworks Model Registry, with local fallback."""
+    model_dir = "models"
+    metrics = {}
+    
     try:
         from src.hopsworks_utils import (
             get_hopsworks_project,
@@ -275,7 +276,12 @@ def load_model_from_registry():
         mr = get_model_registry(project)
         model = get_latest_model(mr)
         model_dir = download_model(model)
+        metrics = model.training_metrics
+        logger.info("Successfully loaded models from Hopsworks registry.")
+    except Exception as exc:
+        logger.warning("Failed to load model from Hopsworks: %s. Falling back to local models/ folder...", exc)
 
+    try:
         # Load individual models for each target
         models = {}
         for target_col in TARGET_COLS:
@@ -296,10 +302,13 @@ def load_model_from_registry():
         fi_path = os.path.join(model_dir, "feature_importance.csv")
         fi_df = pd.read_csv(fi_path) if os.path.exists(fi_path) else pd.DataFrame()
 
-        return models, metadata, fi_df, model.training_metrics
+        if not models:
+            raise FileNotFoundError("No trained models found in either Hopsworks registry or local models/ folder.")
+
+        return models, metadata, fi_df, metrics
 
     except Exception as exc:
-        logger.error("Failed to load model from Hopsworks: %s", exc)
+        logger.error("Failed to load model from both Hopsworks and local fallback: %s", exc)
         return None, None, pd.DataFrame(), {}
 
 

@@ -122,7 +122,7 @@ def insert_features(fg, df: pd.DataFrame) -> None:
     if available_pollutants:
         df = df.dropna(subset=available_pollutants, how="all")
 
-    fg.insert(df, write_options={"wait_for_job": True})
+    fg.insert(df, write_options={"wait_for_job": False})
     logger.info("Successfully inserted %d rows", len(df))
 
 
