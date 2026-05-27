@@ -55,7 +55,8 @@ jobs:
       - name: Run Training Pipeline
         env:
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
-          HOPSWORKS_PROJECT: ${{ secrets.HOPSWORKS_PROJECT }}
+          HOPSWORKS_PROJECT: ${{ secrets.HOPSWORKS_PROJECT || secrets.HOPSWORKS_PROJECT_NAME || vars.HOPSWORKS_PROJECT || vars.HOPSWORKS_PROJECT_NAME }}
+          HOPSWORKS_PROJECT_NAME: ${{ secrets.HOPSWORKS_PROJECT || secrets.HOPSWORKS_PROJECT_NAME || vars.HOPSWORKS_PROJECT || vars.HOPSWORKS_PROJECT_NAME }}
         run: |
           python training_pipeline.py
 

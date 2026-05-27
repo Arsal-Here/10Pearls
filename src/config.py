@@ -13,8 +13,17 @@ load_dotenv()
 # =============================================================================
 # Hopsworks Configuration
 # =============================================================================
-HOPSWORKS_API_KEY = os.getenv("HOPSWORKS_API_KEY")
-HOPSWORKS_PROJECT = os.getenv("HOPSWORKS_PROJECT") or os.getenv("HOPSWORKS_PROJECT_NAME")
+def _get_clean_env(key: str) -> str | None:
+    val = os.getenv(key)
+    if val is not None:
+        val = val.strip()
+        if val == "":
+            return None
+    return val
+
+HOPSWORKS_API_KEY = _get_clean_env("HOPSWORKS_API_KEY")
+HOPSWORKS_PROJECT = _get_clean_env("HOPSWORKS_PROJECT") or _get_clean_env("HOPSWORKS_PROJECT_NAME")
+
 
 FEATURE_GROUP_NAME = "karachi_aqi_features"
 FEATURE_GROUP_VERSION = 1
