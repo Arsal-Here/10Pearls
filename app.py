@@ -10,9 +10,7 @@ Usage:
 
 import logging
 import os
-import sys
 from datetime import datetime, timedelta
-from typing import Optional
 
 import joblib
 import numpy as np
@@ -23,13 +21,11 @@ import streamlit as st
 from src.aqi_calculator import calculate_aqi, calculate_all_sub_indices
 from src.config import (
     AQI_CATEGORIES,
-    CITY_NAME,
-    MODEL_NAME,
     TARGET_COLS,
     get_aqi_category,
 )
 from src.data_fetcher import fetch_air_quality_recent, fetch_weather_recent
-from src.feature_engineering import build_feature_dataframe, get_feature_columns
+from src.feature_engineering import build_feature_dataframe
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -259,27 +255,9 @@ st.markdown("""
 # ---------------------------------------------------------------------------
 
 @st.cache_resource(ttl=3600, show_spinner="Loading trained models...")
-def load_model_from_registry():
-    """Load the trained model from Hopsworks Model Registry, with local fallback."""
+def load_local_models():
+    """Load trained models from local model artifacts."""
     model_dir = "models"
-    metrics = {}
-    
-    try:
-        from src.hopsworks_utils import (
-            get_hopsworks_project,
-            get_model_registry,
-            get_latest_model,
-            download_model,
-        )
-
-        project = get_hopsworks_project()
-        mr = get_model_registry(project)
-        model = get_latest_model(mr)
-        model_dir = download_model(model)
-        metrics = model.training_metrics
-        logger.info("Successfully loaded models from Hopsworks registry.")
-    except Exception as exc:
-        logger.warning("Failed to load model from Hopsworks: %s. Falling back to local models/ folder...", exc)
 
     try:
         # Load individual models for each target
@@ -303,13 +281,13 @@ def load_model_from_registry():
         fi_df = pd.read_csv(fi_path) if os.path.exists(fi_path) else pd.DataFrame()
 
         if not models:
-            raise FileNotFoundError("No trained models found in either Hopsworks registry or local models/ folder.")
+            raise FileNotFoundError("No trained models found in local models/ folder.")
 
-        return models, metadata, fi_df, metrics
+        return models, metadata, fi_df
 
     except Exception as exc:
-        logger.error("Failed to load model from both Hopsworks and local fallback: %s", exc)
-        return None, None, pd.DataFrame(), {}
+        logger.error("Failed to load local model artifacts: %s", exc)
+        return None, None, pd.DataFrame()
 
 
 @st.cache_data(ttl=1800, show_spinner="Fetching live data from Open-Meteo...")
@@ -579,7 +557,7 @@ def main():
     # ── Load data ──
     with st.spinner("Loading latest data..."):
         live_df = load_live_data()
-        models, metadata, fi_df, model_metrics = load_model_from_registry()
+        models, metadata, fi_df = load_local_models()
 
     if live_df.empty:
         st.error("⚠️ Unable to fetch live data from Open-Meteo. Please try again later.")
@@ -777,14 +755,6 @@ def main():
             </div>
             """, unsafe_allow_html=True)
 
-        elif model_metrics:
-            for key, val in model_metrics.items():
-                st.markdown(f"""
-                <div class="sidebar-metric">
-                    <div class="label">{key.upper()}</div>
-                    <div class="value">{val}</div>
-                </div>
-                """, unsafe_allow_html=True)
         else:
             st.info("No model loaded. Run the training pipeline first.")
 

@@ -1,8 +1,8 @@
 # =============================================================================
 # Training Pipeline — Daily Scheduled Workflow
 # =============================================================================
-# Pulls features from Hopsworks, trains multiple models (XGBoost, RF, Ridge),
-# evaluates performance, and registers the best model in the Model Registry.
+# Pulls features from MongoDB, trains multiple models (XGBoost, RF, Ridge),
+# evaluates performance, and saves refreshed local model artifacts.
 #
 # Schedule: Daily at 02:00 UTC
 # Manual: Can also be triggered via workflow_dispatch
@@ -54,9 +54,9 @@ jobs:
       # --------------------------------------------------
       - name: Run Training Pipeline
         env:
-          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
-          HOPSWORKS_PROJECT: ${{ secrets.HOPSWORKS_PROJECT || secrets.HOPSWORKS_PROJECT_NAME || vars.HOPSWORKS_PROJECT || vars.HOPSWORKS_PROJECT_NAME }}
-          HOPSWORKS_PROJECT_NAME: ${{ secrets.HOPSWORKS_PROJECT || secrets.HOPSWORKS_PROJECT_NAME || vars.HOPSWORKS_PROJECT || vars.HOPSWORKS_PROJECT_NAME }}
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          MONGODB_DATABASE: ${{ secrets.MONGODB_DATABASE || vars.MONGODB_DATABASE }}
+          MONGODB_FEATURE_COLLECTION: ${{ secrets.MONGODB_FEATURE_COLLECTION || vars.MONGODB_FEATURE_COLLECTION }}
         run: |
           python training_pipeline.py
 

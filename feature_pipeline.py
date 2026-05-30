@@ -2,7 +2,7 @@
 Feature Pipeline — Karachi AQI Prediction Service
 
 Fetches air quality and weather data from Open-Meteo, computes ML features,
-and inserts them into the Hopsworks Feature Store.
+and upserts them into a MongoDB feature store collection.
 
 Usage:
     # Hourly incremental ingestion (default)
@@ -26,11 +26,10 @@ from src.data_fetcher import (
     fetch_historical_in_chunks,
 )
 from src.feature_engineering import build_feature_dataframe
-from src.hopsworks_utils import (
-    get_hopsworks_project,
-    get_feature_store,
-    get_or_create_feature_group,
-    insert_features,
+from src.mongodb_utils import (
+    get_feature_collection,
+    get_mongo_client,
+    upsert_features,
 )
 
 # ---------------------------------------------------------------------------
@@ -54,7 +53,7 @@ def run_hourly_pipeline() -> None:
     Hourly incremental pipeline:
       1. Fetch last 5 days of data (overlap for rolling features)
       2. Compute features
-      3. Upsert into Hopsworks feature group
+      3. Upsert into MongoDB feature collection
     """
     logger.info("=" * 60)
     logger.info("STARTING HOURLY FEATURE PIPELINE")
@@ -74,15 +73,17 @@ def run_hourly_pipeline() -> None:
     feature_df = build_feature_dataframe(raw_df)
     logger.info("Computed %d features × %d rows", len(feature_df.columns), len(feature_df))
 
-    # Step 3: Insert into Hopsworks
-    logger.info("Step 3/3: Connecting to Hopsworks and inserting features...")
-    project = get_hopsworks_project()
-    fs = get_feature_store(project)
-    fg = get_or_create_feature_group(fs, feature_df)
-    insert_features(fg, feature_df)
+    # Step 3: Insert into MongoDB
+    logger.info("Step 3/3: Connecting to MongoDB and upserting features...")
+    client = get_mongo_client(prompt_if_missing=True)
+    try:
+        collection = get_feature_collection(client)
+        inserted_rows = upsert_features(collection, feature_df)
+    finally:
+        client.close()
 
     logger.info("=" * 60)
-    logger.info("HOURLY FEATURE PIPELINE COMPLETE — %d rows inserted", len(feature_df))
+    logger.info("HOURLY FEATURE PIPELINE COMPLETE — %d rows upserted", inserted_rows)
     logger.info("=" * 60)
 
 
@@ -91,7 +92,7 @@ def run_backfill_pipeline(start_date: str, end_date: str) -> None:
     Historical backfill pipeline:
       1. Fetch data in monthly chunks from start_date to end_date
       2. Compute features for entire range
-      3. Insert into Hopsworks feature group
+      3. Upsert into MongoDB feature collection
     """
     logger.info("=" * 60)
     logger.info("STARTING BACKFILL PIPELINE: %s → %s", start_date, end_date)
@@ -116,33 +117,35 @@ def run_backfill_pipeline(start_date: str, end_date: str) -> None:
     feature_df = build_feature_dataframe(raw_df)
     logger.info("Computed %d features × %d rows", len(feature_df.columns), len(feature_df))
 
-    # Save a local copy to bypass Hopsworks cluster overload if needed
+    # Save a local copy to simplify recovery/retraining if needed
     import os
     os.makedirs("data", exist_ok=True)
     feature_df.to_csv("data/karachi_aqi_features.csv", index=False)
     logger.info("Successfully saved local cache of features to 'data/karachi_aqi_features.csv'")
-
-    # Step 3: Insert into Hopsworks (in batches if very large)
-    logger.info("Step 3/3: Connecting to Hopsworks and inserting features...")
-    project = get_hopsworks_project()
-    fs = get_feature_store(project)
-    fg = get_or_create_feature_group(fs, feature_df)
+    # Step 3: Insert into MongoDB (in batches if very large)
+    logger.info("Step 3/3: Connecting to MongoDB and upserting features...")
+    client = get_mongo_client(prompt_if_missing=True)
+    collection = get_feature_collection(client)
 
     # Insert in batches of 5000 to avoid memory issues on free tier
     batch_size = 5000
     total_rows = len(feature_df)
+    upserted_total = 0
 
-    for start_idx in range(0, total_rows, batch_size):
-        end_idx = min(start_idx + batch_size, total_rows)
-        batch = feature_df.iloc[start_idx:end_idx]
-        logger.info(
-            "Inserting batch %d–%d of %d...",
-            start_idx + 1, end_idx, total_rows,
-        )
-        insert_features(fg, batch)
+    try:
+        for start_idx in range(0, total_rows, batch_size):
+            end_idx = min(start_idx + batch_size, total_rows)
+            batch = feature_df.iloc[start_idx:end_idx]
+            logger.info(
+                "Upserting batch %d–%d of %d...",
+                start_idx + 1, end_idx, total_rows,
+            )
+            upserted_total += upsert_features(collection, batch)
+    finally:
+        client.close()
 
     logger.info("=" * 60)
-    logger.info("BACKFILL PIPELINE COMPLETE — %d total rows inserted", total_rows)
+    logger.info("BACKFILL PIPELINE COMPLETE — %d total rows upserted", upserted_total)
     logger.info("=" * 60)
 
 
@@ -153,7 +156,7 @@ def run_backfill_pipeline(start_date: str, end_date: str) -> None:
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Karachi AQI Feature Pipeline — fetch data and store features in Hopsworks",
+        description="Karachi AQI Feature Pipeline — fetch data and store features in MongoDB",
     )
     parser.add_argument(
         "--backfill",

@@ -1,9 +1,8 @@
 """
 Training Pipeline — Karachi AQI Prediction Service
 
-Pulls features from Hopsworks Feature Store, trains multiple models,
-evaluates them, and registers the best-performing model in the
-Hopsworks Model Registry.
+Pulls features from MongoDB Feature Store, trains multiple models,
+evaluates them, and saves model artifacts locally.
 
 Usage:
     python training_pipeline.py
@@ -13,7 +12,6 @@ import logging
 import os
 import sys
 import tempfile
-from pathlib import Path
 
 import joblib
 import numpy as np
@@ -21,19 +19,14 @@ import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import TimeSeriesSplit
 from xgboost import XGBRegressor
 
-from src.config import TARGET_COLS, MODEL_NAME
+from src.config import TARGET_COLS
 from src.feature_engineering import get_feature_columns
-from src.hopsworks_utils import (
-    get_hopsworks_project,
-    get_feature_store,
-    get_or_create_feature_group,
-    get_or_create_feature_view,
+from src.mongodb_utils import (
+    get_feature_collection,
+    get_mongo_client,
     get_training_data,
-    get_model_registry,
-    register_model,
 )
 
 # ---------------------------------------------------------------------------
@@ -284,8 +277,6 @@ def main() -> None:
     logger.info("=" * 60)
     logger.info("STARTING TRAINING PIPELINE")
     logger.info("=" * 60)
-
-    # Step 1: Connect to Hopsworks and pull data
     df = None
 
     # Check if local data cache is available
@@ -296,24 +287,25 @@ def main() -> None:
             df = pd.read_csv(local_cache_path)
             logger.info("Successfully loaded %d rows from local cache", len(df))
         except Exception as e:
-            logger.error("Failed to load local cache: %s. Will try Hopsworks instead.", e)
+            logger.error("Failed to load local cache: %s. Will try MongoDB instead.", e)
 
     if df is None:
-        logger.info("Step 1/5: Connecting to Hopsworks...")
+        logger.info("Step 1/4: Connecting to MongoDB feature store...")
+        client = None
         try:
-            project = get_hopsworks_project()
-            fs = get_feature_store(project)
-
-            # Get feature group first (needed for feature view creation)
-            fg = fs.get_feature_group(name="karachi_aqi_features", version=1)
-            fv = get_or_create_feature_view(fs, fg)
-
-            logger.info("Step 2/5: Pulling training data from Feature Store...")
-            df = get_training_data(fv)
+            client = get_mongo_client(prompt_if_missing=True)
+            collection = get_feature_collection(client)
+            logger.info("Step 2/4: Pulling training data from MongoDB...")
+            df = get_training_data(collection)
             logger.info("Retrieved %d rows × %d columns", len(df), len(df.columns))
         except Exception as exc:
-            logger.error("Failed to connect/pull from Hopsworks: %s", exc)
-            raise RuntimeError("Unable to get training data from Hopsworks and no valid local cache exists.")
+            logger.error("Failed to connect/pull from MongoDB: %s", exc)
+            raise RuntimeError(
+                "Unable to get training data from MongoDB and no valid local cache exists."
+            )
+        finally:
+            if client is not None:
+                client.close()
 
     # Step 2: Train models for each target horizon
     all_best_models = {}
@@ -327,8 +319,7 @@ def main() -> None:
 
         try:
             X_train, X_val, y_train, y_val, feature_names = prepare_data(df, target_col)
-
-            best_model, best_name, best_metrics, all_results, fi_df = (
+            best_model, best_name, best_metrics, _all_results, fi_df = (
                 train_and_evaluate_models(
                     X_train, X_val, y_train, y_val, feature_names, target_col,
                 )
@@ -354,7 +345,7 @@ def main() -> None:
         sys.exit(1)
 
     # Step 3: Save model artifacts
-    logger.info("\nStep 3/5: Saving model artifacts...")
+    logger.info("\nStep 3/4: Saving model artifacts...")
 
     model_dir = tempfile.mkdtemp(prefix="karachi_aqi_model_")
     local_models_dir = "models"
@@ -385,6 +376,7 @@ def main() -> None:
         logger.info("Saved feature importance → %s and %s", fi_path, local_fi_path)
 
     # Save model metadata
+    n_features = len(next(iter(all_best_models.values()))["feature_names"])
     metadata = {
         "models": {
             target: {
@@ -393,7 +385,7 @@ def main() -> None:
             }
             for target, info in all_best_models.items()
         },
-        "n_features": len(feature_names),
+        "n_features": n_features,
         "training_rows": len(df),
     }
     metadata_path = os.path.join(model_dir, "metadata.joblib")
@@ -403,38 +395,7 @@ def main() -> None:
     joblib.dump(metadata, local_metadata_path)
     logger.info("Saved metadata → %s and %s", metadata_path, local_metadata_path)
 
-    # Step 4: Register in Hopsworks Model Registry
-    logger.info("Step 4/5: Registering model in Hopsworks Model Registry...")
-    try:
-        mr = get_model_registry(project)
-
-        # Use the 24h target metrics as the primary model metrics
-        primary_metrics = all_best_metrics.get(
-            "aqi_target_24h",
-            next(iter(all_best_metrics.values())),
-        )
-
-        primary_model_name = all_best_models.get(
-            "aqi_target_24h", next(iter(all_best_models.values()))
-        )["name"]
-
-        description = (
-            f"Karachi AQI multi-horizon prediction model. "
-            f"Best algorithm: {primary_model_name}. "
-            f"Targets: {', '.join(TARGET_COLS)}. "
-            f"Trained on {len(df)} rows with {len(feature_names)} features."
-        )
-
-        register_model(
-            mr=mr,
-            model_dir=model_dir,
-            metrics=primary_metrics,
-            description=description,
-        )
-    except Exception as exc:
-        logger.warning("Could not register model in Hopsworks Model Registry: %s. Operating completely offline with local model files.", exc)
-
-    # Step 5: Summary
+    # Step 4: Summary
     logger.info("\n" + "=" * 60)
     logger.info("TRAINING PIPELINE COMPLETE")
     logger.info("=" * 60)
@@ -446,8 +407,7 @@ def main() -> None:
             target_col, model_type,
             metrics["rmse"], metrics["mae"], metrics["r2"],
         )
-
-    logger.info("Model registered in Hopsworks Model Registry")
+    logger.info("Model artifacts updated in local '%s' directory", local_models_dir)
     logger.info("=" * 60)
 
 

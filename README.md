@@ -3,7 +3,7 @@
 A **100% serverless** Air Quality Index (AQI) prediction service for Karachi, Pakistan, forecasting AQI levels for the next 3 days using a Feature/Training/Inference pipeline architecture.
 
 ![Python 3.11](https://img.shields.io/badge/Python-3.11-blue?style=flat-square)
-![Hopsworks](https://img.shields.io/badge/Feature%20Store-Hopsworks-green?style=flat-square)
+![MongoDB](https://img.shields.io/badge/Feature%20Store-MongoDB-47A248?style=flat-square)
 ![GitHub Actions](https://img.shields.io/badge/CI%2FCD-GitHub%20Actions-blue?style=flat-square)
 ![Streamlit](https://img.shields.io/badge/Dashboard-Streamlit-red?style=flat-square)
 
@@ -19,20 +19,20 @@ A **100% serverless** Air Quality Index (AQI) prediction service for Karachi, Pa
 │  │ Feature Pipeline      │      │ Training Pipeline              │   │
 │  │ (Hourly Cron)         │      │ (Daily Cron)                   │   │
 │  │                       │      │                                │   │
-│  │ Open-Meteo API ──────►│      │ Hopsworks FS ──► Train Models │   │
+│  │ Open-Meteo API ──────►│      │ MongoDB FS ──► Train Models   │   │
 │  │ Compute Features      │      │ Evaluate (RMSE/MAE/R²)        │   │
-│  │ Insert → Hopsworks FS │      │ Register → Model Registry     │   │
+│  │ Upsert → MongoDB FS   │      │ Save → local model artifacts  │   │
 │  └──────────────────────┘      └───────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                      Hopsworks (Serverless)                         │
+│                        MongoDB Feature Store                         │
 │                                                                     │
-│  ┌──────────────────┐      ┌──────────────────────┐                │
-│  │ Feature Store     │      │ Model Registry        │                │
-│  │ (Feature Groups)  │      │ (Versioned Models)    │                │
-│  └──────────────────┘      └──────────────────────┘                │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │ Collection: karachi_aqi_features                             │   │
+│  │ Unique key: timestamp (upserted hourly/backfill)             │   │
+│  └──────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -55,7 +55,7 @@ A **100% serverless** Air Quality Index (AQI) prediction service for Karachi, Pa
 ### 1. Prerequisites
 
 - Python 3.11+
-- A free [Hopsworks](https://www.hopsworks.ai/) account
+- A MongoDB deployment (Atlas or self-hosted)
 - A GitHub repository (for automated pipelines)
 
 ### 2. Clone & Install
@@ -79,15 +79,13 @@ pip install -r requirements.txt
 cp .env.example .env
 
 # Edit .env with your credentials
-# HOPSWORKS_API_KEY=your_key_here
-# HOPSWORKS_PROJECT=your_project_name
+# MONGODB_URI=mongodb+srv://<user>:<password>@<cluster>/<db>?retryWrites=true&w=majority
+
+# MONGODB_DATABASE=karachi_aqi
+# MONGODB_FEATURE_COLLECTION=karachi_aqi_features
 ```
 
-**Getting your Hopsworks API key:**
-1. Go to [app.hopsworks.ai](https://app.hopsworks.ai/)
-2. Create a free project
-3. Go to **Account Settings** → **API Keys** → **Create New**
-4. Copy the key into your `.env` file
+If `MONGODB_URI` is not set, the CLI pipelines will prompt for it at runtime.
 
 ### 4. Run Historical Backfill
 
@@ -108,7 +106,7 @@ python training_pipeline.py
 This will:
 - Pull data from the Feature Store
 - Train XGBoost, Random Forest, and Ridge Regression
-- Register the best model in the Hopsworks Model Registry
+- Refresh local model artifacts in `models/`
 
 ### 6. Launch the Dashboard
 
@@ -128,15 +126,16 @@ Go to your repo → **Settings** → **Secrets and variables** → **Actions** �
 
 | Secret Name | Value |
 |---|---|
-| `HOPSWORKS_API_KEY` | Your Hopsworks API key |
-| `HOPSWORKS_PROJECT` | Your Hopsworks project name |
+| `MONGODB_URI` | MongoDB connection string |
+| `MONGODB_DATABASE` *(optional)* | Database name (default: `karachi_aqi`) |
+| `MONGODB_FEATURE_COLLECTION` *(optional)* | Feature collection (default: `karachi_aqi_features`) |
 
 ### Automated Workflows
 
 | Workflow | Schedule | Description |
 |---|---|---|
-| `feature-pipeline-hourly.yml` | Every hour | Fetches latest data, computes features, stores in Hopsworks |
-| `training-pipeline-daily.yml` | Daily at 2 AM UTC | Retrains models, evaluates, updates Model Registry |
+| `feature-pipeline-hourly.yml` | Every hour | Fetches latest data, computes features, stores in MongoDB |
+| `training-pipeline-daily.yml` | Daily at 2 AM UTC | Retrains models using MongoDB feature data and refreshes model artifacts |
 
 Both workflows also support **manual triggering** via the "Run workflow" button in GitHub Actions.
 
@@ -156,7 +155,7 @@ Both workflows also support **manual triggering** via the "Run workflow" button 
 │   ├── aqi_calculator.py           # EPA AQI formula implementation
 │   ├── data_fetcher.py             # Open-Meteo API client
 │   ├── feature_engineering.py      # Feature computation
-│   └── hopsworks_utils.py          # Hopsworks connection helpers
+│   └── mongodb_utils.py            # MongoDB feature-store helpers
 │
 ├── feature_pipeline.py             # Data ingestion pipeline
 ├── training_pipeline.py            # Model training pipeline
@@ -198,7 +197,7 @@ Three models are trained and compared:
 
 **Evaluation Metrics:** RMSE, MAE, R² Score
 
-The best-performing model (lowest RMSE on time-ordered validation set) is automatically registered in the Hopsworks Model Registry.
+The best-performing models (lowest RMSE per target horizon) are saved as local artifacts in `models/`.
 
 ---
 
@@ -208,11 +207,7 @@ The best-performing model (lowest RMSE on time-ordered validation set) is automa
 2. Go to [share.streamlit.io](https://share.streamlit.io/)
 3. Connect your GitHub repo
 4. Set the main file path to `app.py`
-5. Add secrets in the Streamlit Cloud dashboard:
-   ```toml
-   HOPSWORKS_API_KEY = "your_key"
-   HOPSWORKS_PROJECT = "your_project"
-   ```
+5. Ensure the `models/` artifacts are available in your deployment.
 
 ---
 

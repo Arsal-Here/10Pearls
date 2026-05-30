@@ -2,7 +2,7 @@
 # Feature Pipeline — Hourly Scheduled Workflow
 # =============================================================================
 # Fetches latest air quality + weather data from Open-Meteo for Karachi,
-# computes ML features, and inserts them into the Hopsworks Feature Store.
+# computes ML features, and upserts them into MongoDB.
 #
 # Schedule: Every hour at minute 0
 # Manual: Can also be triggered via workflow_dispatch
@@ -63,9 +63,9 @@ jobs:
       # --------------------------------------------------
       - name: Run Feature Pipeline
         env:
-          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
-          HOPSWORKS_PROJECT: ${{ secrets.HOPSWORKS_PROJECT || secrets.HOPSWORKS_PROJECT_NAME || vars.HOPSWORKS_PROJECT || vars.HOPSWORKS_PROJECT_NAME }}
-          HOPSWORKS_PROJECT_NAME: ${{ secrets.HOPSWORKS_PROJECT || secrets.HOPSWORKS_PROJECT_NAME || vars.HOPSWORKS_PROJECT || vars.HOPSWORKS_PROJECT_NAME }}
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          MONGODB_DATABASE: ${{ secrets.MONGODB_DATABASE || vars.MONGODB_DATABASE }}
+          MONGODB_FEATURE_COLLECTION: ${{ secrets.MONGODB_FEATURE_COLLECTION || vars.MONGODB_FEATURE_COLLECTION }}
         run: |
           if [ "${{ github.event.inputs.backfill }}" = "true" ]; then
             echo "Running backfill mode..."

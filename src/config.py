@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # =============================================================================
-# Hopsworks Configuration
+# Environment Helpers
 # =============================================================================
 def _get_clean_env(key: str) -> str | None:
     val = os.getenv(key)
@@ -20,15 +20,16 @@ def _get_clean_env(key: str) -> str | None:
         if val == "":
             return None
     return val
+# =============================================================================
+# MongoDB Feature Store Configuration
+# =============================================================================
+MONGODB_URI = _get_clean_env("MONGODB_URI")
+MONGODB_DATABASE = _get_clean_env("MONGODB_DATABASE") or "karachi_aqi"
+MONGODB_FEATURE_COLLECTION = (
+    _get_clean_env("MONGODB_FEATURE_COLLECTION") or "karachi_aqi_features"
+)
 
-HOPSWORKS_API_KEY = _get_clean_env("HOPSWORKS_API_KEY")
-HOPSWORKS_PROJECT = _get_clean_env("HOPSWORKS_PROJECT") or _get_clean_env("HOPSWORKS_PROJECT_NAME")
 
-
-FEATURE_GROUP_NAME = "karachi_aqi_features"
-FEATURE_GROUP_VERSION = 1
-FEATURE_VIEW_NAME = "karachi_aqi_fv"
-FEATURE_VIEW_VERSION = 1
 MODEL_NAME = "karachi_aqi_model"
 
 # =============================================================================
@@ -84,7 +85,7 @@ TIME_FEATURE_COLS = [
 # Target columns (AQI at future horizons)
 TARGET_COLS = ["aqi_target_24h", "aqi_target_48h", "aqi_target_72h"]
 
-# Primary key for feature group (must be unique)
+# Primary key for feature collection (must be unique)
 PRIMARY_KEY = ["timestamp"]
 EVENT_TIME = "timestamp"
 

@@ -276,7 +276,7 @@ def build_feature_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     # Step 6: Targets (only meaningful for training data)
     df = compute_targets(df)
 
-    # Convert timestamp to integer (Unix epoch ms) for Hopsworks compatibility
+    # Convert timestamp to integer (Unix epoch ms) for storage compatibility
     df["timestamp"] = (
         pd.to_datetime(df["timestamp"])
         .astype("int64") // 10**6  # milliseconds
