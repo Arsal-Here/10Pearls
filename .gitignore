@@ -28,9 +28,9 @@ env/
 Thumbs.db
 
 # Model artifacts (local)
-models/
+# models/
 *.pkl
-*.joblib
+# *.joblib
 *.h5
 
 # Jupyter
