@@ -8,6 +8,14 @@ Usage:
     streamlit run app.py
 """
 
+import sys
+from pathlib import Path
+
+# Streamlit Cloud mounts repos under /mount/src/<repo>; ensure project root is on path.
+_APP_ROOT = Path(__file__).resolve().parent
+if str(_APP_ROOT) not in sys.path:
+    sys.path.insert(0, str(_APP_ROOT))
+
 import io
 import logging
 import os

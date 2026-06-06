@@ -18,7 +18,7 @@ from pymongo.collection import Collection
 from bson.binary import Binary
 from datetime import datetime
 
-from src.config import (
+from .config import (
     MONGODB_DATABASE,
     MONGODB_FEATURE_COLLECTION,
     MONGODB_MODEL_COLLECTION,

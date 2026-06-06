@@ -11,8 +11,9 @@ scikit-learn>=1.3.0
 xgboost>=2.0.0
 joblib>=1.3.0
 
-# Feature Store
-pymongo>=4.8.0
+# Feature Store (use pymongo's bundled bson — do NOT install standalone "bson")
+pymongo[srv]>=4.8.0
+dnspython>=2.0.0
 
 # API & Networking
 requests>=2.31.0

@@ -13,7 +13,7 @@ from typing import Optional
 import pandas as pd
 import requests
 
-from src.config import (
+from .config import (
     KARACHI_LAT,
     KARACHI_LON,
     AIR_QUALITY_URL,

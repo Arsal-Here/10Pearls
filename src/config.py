@@ -6,9 +6,13 @@ and AQI category thresholds used across all pipeline stages.
 """
 
 import os
-from dotenv import load_dotenv
 
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
 
 # =============================================================================
 # Environment Helpers
@@ -19,7 +23,19 @@ def _get_clean_env(key: str) -> str | None:
         val = val.strip()
         if val == "":
             return None
-    return val
+        return val
+
+    # Streamlit Cloud injects secrets via st.secrets (no .env on deploy).
+    try:
+        import streamlit as st
+
+        if key in st.secrets:
+            secret_val = str(st.secrets[key]).strip()
+            return secret_val or None
+    except Exception:
+        pass
+
+    return None
 # =============================================================================
 # MongoDB Feature Store Configuration
 # =============================================================================

@@ -12,8 +12,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from src.aqi_calculator import calculate_aqi
-from src.config import (
+from .aqi_calculator import calculate_aqi
+from .config import (
     POLLUTANT_COLS,
     ROLLING_WINDOWS,
     LAG_STEPS,

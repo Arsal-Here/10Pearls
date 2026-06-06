@@ -11,7 +11,7 @@ Reference: EPA Technical Assistance Document (EPA-454/B-18-007)
 import logging
 from typing import Optional
 
-from src.config import (
+from .config import (
     PM25_BREAKPOINTS,
     PM10_BREAKPOINTS,
     NO2_BREAKPOINTS_UGM3,
