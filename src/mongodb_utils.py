@@ -15,9 +15,13 @@ import pandas as pd
 from pymongo import ASCENDING, MongoClient, UpdateOne
 from pymongo.collection import Collection
 
+from bson.binary import Binary
+from datetime import datetime
+
 from src.config import (
     MONGODB_DATABASE,
     MONGODB_FEATURE_COLLECTION,
+    MONGODB_MODEL_COLLECTION,
     MONGODB_URI,
     PRIMARY_KEY,
 )
@@ -82,6 +86,51 @@ def get_feature_collection(client: MongoClient) -> Collection:
     ensure_feature_indexes(collection)
     logger.info("Feature collection ready: %s.%s", database_name, collection_name)
     return collection
+
+
+def get_model_collection(client: MongoClient) -> Collection:
+    """
+    Return the configured MongoDB collection used for model storage.
+    """
+    database_name = _clean_value(os.getenv("MONGODB_DATABASE")) or MONGODB_DATABASE
+    collection_name = (
+        _clean_value(os.getenv("MONGODB_MODEL_COLLECTION")) or MONGODB_MODEL_COLLECTION
+    )
+
+    collection = client[database_name][collection_name]
+    collection.create_index([("filename", ASCENDING)], unique=True)
+    logger.info("Model collection ready: %s.%s", database_name, collection_name)
+    return collection
+
+
+def upload_model_file(collection: Collection, filename: str, content_bytes: bytes) -> None:
+    """
+    Upload or update a model artifact in MongoDB.
+    """
+    collection.update_one(
+        {"filename": filename},
+        {
+            "$set": {
+                "filename": filename,
+                "content": Binary(content_bytes),
+                "updated_at": datetime.utcnow(),
+            }
+        },
+        upsert=True,
+    )
+    logger.info("Successfully uploaded '%s' to MongoDB cloud", filename)
+
+
+def download_model_file(collection: Collection, filename: str) -> bytes | None:
+    """
+    Download a model artifact from MongoDB.
+    """
+    doc = collection.find_one({"filename": filename})
+    if doc and "content" in doc:
+        logger.info("Successfully downloaded '%s' from MongoDB cloud", filename)
+        return doc["content"]
+    logger.warning("File '%s' not found in MongoDB model store", filename)
+    return None
 
 
 def ensure_feature_indexes(collection: Collection) -> None:

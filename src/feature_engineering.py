@@ -18,6 +18,9 @@ from src.config import (
     ROLLING_WINDOWS,
     LAG_STEPS,
     CHANGE_RATE_WINDOWS,
+    EWMA_SPANS,
+    INTERACTION_PAIRS,
+    DAY_SEGMENTS,
 )
 
 logger = logging.getLogger(__name__)
@@ -123,6 +126,169 @@ def compute_rolling_features(
 
     n_new = len(roll_cols) * len(windows) * 2
     logger.info("Computed rolling features: %d columns added", n_new)
+    return df
+
+
+# =============================================================================
+# Exponential Weighted Moving Average (EWMA) Features
+# =============================================================================
+
+def compute_ewma_features(
+    df: pd.DataFrame,
+    spans: Optional[list[int]] = None,
+) -> pd.DataFrame:
+    """
+    Compute exponential weighted moving averages for key pollutants and AQI.
+
+    EWMA gives more weight to recent observations, making it better at
+    capturing trend shifts compared to simple rolling means.
+
+    Args:
+        df: DataFrame sorted by timestamp.
+        spans: List of span (half-life) sizes in hours.
+
+    Returns:
+        DataFrame with EWMA columns added.
+    """
+    if spans is None:
+        spans = EWMA_SPANS
+
+    df = df.copy()
+    ewma_cols = ["pm2_5", "pm10", "aqi"]
+
+    for col in ewma_cols:
+        if col not in df.columns:
+            continue
+        for span in spans:
+            df[f"{col}_ewma_{span}h"] = (
+                df[col].ewm(span=span, min_periods=1).mean()
+            )
+
+    n_new = len(ewma_cols) * len(spans)
+    logger.info("Computed EWMA features: %d columns added", n_new)
+    return df
+
+
+# =============================================================================
+# Rolling Min / Max / Range Features
+# =============================================================================
+
+def compute_rolling_minmax_features(
+    df: pd.DataFrame,
+    windows: Optional[list[int]] = None,
+) -> pd.DataFrame:
+    """
+    Compute rolling min, max, and range (max-min) for key variables.
+
+    Range captures volatility — high range indicates unstable air quality.
+
+    Args:
+        df: DataFrame sorted by timestamp.
+        windows: List of rolling window sizes in hours.
+
+    Returns:
+        DataFrame with rolling min/max/range columns added.
+    """
+    if windows is None:
+        windows = ROLLING_WINDOWS
+
+    df = df.copy()
+    minmax_cols = ["pm2_5", "pm10", "aqi"]
+
+    for col in minmax_cols:
+        if col not in df.columns:
+            continue
+        for window in windows:
+            roll = df[col].rolling(window=window, min_periods=1)
+            df[f"{col}_rolling_min_{window}h"] = roll.min()
+            df[f"{col}_rolling_max_{window}h"] = roll.max()
+            df[f"{col}_range_{window}h"] = (
+                df[f"{col}_rolling_max_{window}h"] - df[f"{col}_rolling_min_{window}h"]
+            )
+
+    n_new = len(minmax_cols) * len(windows) * 3
+    logger.info("Computed rolling min/max/range features: %d columns added", n_new)
+    return df
+
+
+# =============================================================================
+# Pollutant × Weather Interaction Features
+# =============================================================================
+
+def compute_interaction_features(
+    df: pd.DataFrame,
+    pairs: Optional[list[tuple[str, str]]] = None,
+) -> pd.DataFrame:
+    """
+    Compute interaction features between pollutants and weather variables.
+
+    Captures effects like humidity amplifying PM2.5 impact, or wind speed
+    aiding pollutant dispersion.
+
+    Args:
+        df: DataFrame with pollutant and weather columns.
+        pairs: List of (pollutant_col, weather_col) tuples.
+
+    Returns:
+        DataFrame with interaction columns added.
+    """
+    if pairs is None:
+        pairs = INTERACTION_PAIRS
+
+    df = df.copy()
+    n_new = 0
+
+    for col_a, col_b in pairs:
+        if col_a in df.columns and col_b in df.columns:
+            df[f"{col_a}_x_{col_b}"] = df[col_a] * df[col_b]
+            n_new += 1
+
+    # Temperature-Humidity Index: proxy for atmospheric conditions
+    if "temperature" in df.columns and "humidity" in df.columns:
+        df["temp_humidity_idx"] = df["temperature"] * df["humidity"] / 100.0
+        n_new += 1
+
+    logger.info("Computed interaction features: %d columns added", n_new)
+    return df
+
+
+# =============================================================================
+# Advanced Time Features
+# =============================================================================
+
+def compute_advanced_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute additional time-based features beyond the basics.
+
+    Features:
+        - day_segment (0=Night, 1=Morning, 2=Afternoon, 3=Evening)
+        - day_of_year_sin, day_of_year_cos (cyclical day-of-year)
+        - week_of_year_sin, week_of_year_cos (cyclical week)
+    """
+    df = df.copy()
+
+    # Day segment from hour (requires 'hour' column to exist)
+    if "hour" in df.columns:
+        conditions = []
+        choices = []
+        for idx, (segment_name, (start, end)) in enumerate(DAY_SEGMENTS.items()):
+            conditions.append((df["hour"] >= start) & (df["hour"] < end))
+            choices.append(idx)
+        df["day_segment"] = np.select(conditions, choices, default=0)
+
+    # Day-of-year cyclical encoding — requires timestamp parsing
+    if "timestamp" in df.columns:
+        ts = pd.to_datetime(df["timestamp"], errors="coerce")
+        if ts.notna().any():
+            day_of_year = ts.dt.dayofyear
+            df["day_of_year_sin"] = np.sin(2 * np.pi * day_of_year / 365.25)
+            df["day_of_year_cos"] = np.cos(2 * np.pi * day_of_year / 365.25)
+
+            week_of_year = ts.dt.isocalendar().week.astype(int)
+            df["week_of_year_sin"] = np.sin(2 * np.pi * week_of_year / 52)
+            df["week_of_year_cos"] = np.cos(2 * np.pi * week_of_year / 52)
+
+    logger.info("Computed advanced time features: 5 columns added")
     return df
 
 
@@ -239,10 +405,14 @@ def build_feature_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     Pipeline steps:
         1. Compute current AQI from raw pollutants
         2. Compute time-based features
-        3. Compute rolling window features
-        4. Compute lag features
-        5. Compute AQI change rate features
-        6. Compute forward-looking targets
+        3. Compute advanced time features (day segment, day-of-year)
+        4. Compute rolling window features
+        5. Compute EWMA features
+        6. Compute rolling min/max/range features
+        7. Compute lag features
+        8. Compute AQI change rate features
+        9. Compute pollutant × weather interaction features
+        10. Compute forward-looking targets
 
     Args:
         df: Merged DataFrame with columns: timestamp, pm2_5, pm10,
@@ -264,16 +434,28 @@ def build_feature_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     # Step 2: Time features
     df = compute_time_features(df)
 
-    # Step 3: Rolling features
+    # Step 3: Advanced time features (day segment, day-of-year cyclical)
+    df = compute_advanced_time_features(df)
+
+    # Step 4: Rolling features
     df = compute_rolling_features(df)
 
-    # Step 4: Lag features
+    # Step 5: EWMA features (exponential weighted moving averages)
+    df = compute_ewma_features(df)
+
+    # Step 6: Rolling min/max/range features
+    df = compute_rolling_minmax_features(df)
+
+    # Step 7: Lag features
     df = compute_lag_features(df)
 
-    # Step 5: Change rate features
+    # Step 8: Change rate features
     df = compute_change_rate_features(df)
 
-    # Step 6: Targets (only meaningful for training data)
+    # Step 9: Pollutant × weather interaction features
+    df = compute_interaction_features(df)
+
+    # Step 10: Targets (only meaningful for training data)
     df = compute_targets(df)
 
     # Convert timestamp to integer (Unix epoch ms) for storage compatibility

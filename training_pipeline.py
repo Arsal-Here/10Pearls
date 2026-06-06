@@ -8,6 +8,7 @@ Usage:
     python training_pipeline.py
 """
 
+import io
 import logging
 import os
 import sys
@@ -25,8 +26,10 @@ from src.config import TARGET_COLS
 from src.feature_engineering import get_feature_columns
 from src.mongodb_utils import (
     get_feature_collection,
+    get_model_collection,
     get_mongo_client,
     get_training_data,
+    upload_model_file,
 )
 
 # ---------------------------------------------------------------------------
@@ -49,11 +52,14 @@ def get_model_candidates() -> dict:
     """Return a dict of model name → untrained estimator."""
     return {
         "xgboost": XGBRegressor(
-            n_estimators=300,
+            n_estimators=500,
             max_depth=8,
-            learning_rate=0.05,
+            learning_rate=0.03,
             subsample=0.8,
             colsample_bytree=0.8,
+            min_child_weight=3,
+            reg_alpha=0.1,
+            reg_lambda=1.0,
             random_state=42,
             n_jobs=-1,
             verbosity=0,
@@ -234,7 +240,7 @@ def train_and_evaluate_models(
             }
 
             logger.info(
-                "  %s → RMSE=%.2f, MAE=%.2f, R²=%.4f",
+                "  %s -> RMSE=%.2f, MAE=%.2f, R^2=%.4f",
                 name, metrics["rmse"], metrics["mae"], metrics["r2"],
             )
 
@@ -357,7 +363,7 @@ def main() -> None:
         
         local_model_path = os.path.join(local_models_dir, f"model_{target_col}.joblib")
         joblib.dump(model_info["model"], local_model_path)
-        logger.info("Saved %s → %s and %s", target_col, model_path, local_model_path)
+        logger.info("Saved %s -> %s and %s", target_col, model_path, local_model_path)
 
         # Save feature names for inference
         features_path = os.path.join(model_dir, f"features_{target_col}.joblib")
@@ -373,7 +379,7 @@ def main() -> None:
         
         local_fi_path = os.path.join(local_models_dir, "feature_importance.csv")
         combined_fi.to_csv(local_fi_path, index=False)
-        logger.info("Saved feature importance → %s and %s", fi_path, local_fi_path)
+        logger.info("Saved feature importance -> %s and %s", fi_path, local_fi_path)
 
     # Save model metadata
     n_features = len(next(iter(all_best_models.values()))["feature_names"])
@@ -393,7 +399,49 @@ def main() -> None:
     
     local_metadata_path = os.path.join(local_models_dir, "metadata.joblib")
     joblib.dump(metadata, local_metadata_path)
-    logger.info("Saved metadata → %s and %s", metadata_path, local_metadata_path)
+    logger.info("Saved metadata -> %s and %s", metadata_path, local_metadata_path)
+
+    # Connect and upload to MongoDB Atlas Cloud
+    logger.info("Uploading model artifacts to MongoDB Atlas Cloud...")
+    try:
+        mongo_client = get_mongo_client(prompt_if_missing=True)
+        model_collection = get_model_collection(mongo_client)
+        
+        # Upload individual model and feature files
+        for target_col in TARGET_COLS:
+            # Model file
+            model_filename = f"model_{target_col}.joblib"
+            local_model_path = os.path.join(local_models_dir, model_filename)
+            if os.path.exists(local_model_path):
+                with open(local_model_path, "rb") as f:
+                    upload_model_file(model_collection, model_filename, f.read())
+                
+            # Features file
+            features_filename = f"features_{target_col}.joblib"
+            local_features_path = os.path.join(local_models_dir, features_filename)
+            if os.path.exists(local_features_path):
+                with open(local_features_path, "rb") as f:
+                    upload_model_file(model_collection, features_filename, f.read())
+                
+        # Upload feature importance
+        if not combined_fi.empty:
+            fi_filename = "feature_importance.csv"
+            local_fi_path = os.path.join(local_models_dir, fi_filename)
+            if os.path.exists(local_fi_path):
+                with open(local_fi_path, "rb") as f:
+                    upload_model_file(model_collection, fi_filename, f.read())
+                
+        # Upload metadata
+        metadata_filename = "metadata.joblib"
+        local_metadata_path = os.path.join(local_models_dir, metadata_filename)
+        if os.path.exists(local_metadata_path):
+            with open(local_metadata_path, "rb") as f:
+                upload_model_file(model_collection, metadata_filename, f.read())
+            
+        logger.info("All model artifacts successfully uploaded to MongoDB Atlas Cloud!")
+        mongo_client.close()
+    except Exception as exc:
+        logger.error("Failed to upload model artifacts to MongoDB Atlas Cloud: %s", exc)
 
     # Step 4: Summary
     logger.info("\n" + "=" * 60)
@@ -403,7 +451,7 @@ def main() -> None:
     for target_col, metrics in all_best_metrics.items():
         model_type = all_best_models[target_col]["name"]
         logger.info(
-            "  %s: %s → RMSE=%.2f, MAE=%.2f, R²=%.4f",
+            "  %s: %s -> RMSE=%.2f, MAE=%.2f, R^2=%.4f",
             target_col, model_type,
             metrics["rmse"], metrics["mae"], metrics["r2"],
         )

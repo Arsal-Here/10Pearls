@@ -50,6 +50,8 @@ A **100% serverless** Air Quality Index (AQI) prediction service for Karachi, Pa
 
 ---
 
+## Website: https://aqipredict10p.streamlit.app/
+
 ## 🚀 Quick Start
 
 ### 1. Prerequisites

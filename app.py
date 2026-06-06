@@ -8,6 +8,7 @@ Usage:
     streamlit run app.py
 """
 
+import io
 import logging
 import os
 from datetime import datetime, timedelta
@@ -26,6 +27,11 @@ from src.config import (
 )
 from src.data_fetcher import fetch_air_quality_recent, fetch_weather_recent
 from src.feature_engineering import build_feature_dataframe
+from src.mongodb_utils import (
+    download_model_file,
+    get_model_collection,
+    get_mongo_client,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -254,13 +260,55 @@ st.markdown("""
 # Caching & Data Loading
 # ---------------------------------------------------------------------------
 
-@st.cache_resource(ttl=3600, show_spinner="Loading trained models...")
-def load_local_models():
-    """Load trained models from local model artifacts."""
-    model_dir = "models"
-
+@st.cache_resource(ttl=3600, show_spinner="Loading trained models from MongoDB Atlas...")
+def load_models():
+    """
+    Load trained models and associated artifacts.
+    First tries to retrieve from MongoDB Atlas Cloud, falling back to local files if offline.
+    
+    Returns:
+        (models, metadata, fi_df, load_source)
+    """
+    # ── 1. Try Loading from MongoDB Atlas Cloud ──
     try:
-        # Load individual models for each target
+        logger.info("Attempting to load models from MongoDB Atlas Cloud...")
+        client = get_mongo_client(prompt_if_missing=False)
+        model_collection = get_model_collection(client)
+        
+        models = {}
+        # Load individual models
+        for target_col in TARGET_COLS:
+            model_bytes = download_model_file(model_collection, f"model_{target_col}.joblib")
+            features_bytes = download_model_file(model_collection, f"features_{target_col}.joblib")
+            
+            if model_bytes is not None:
+                models[target_col] = {
+                    "model": joblib.load(io.BytesIO(model_bytes)),
+                    "features": joblib.load(io.BytesIO(features_bytes)) if features_bytes is not None else None,
+                }
+                
+        # Load metadata
+        metadata_bytes = download_model_file(model_collection, "metadata.joblib")
+        metadata = joblib.load(io.BytesIO(metadata_bytes)) if metadata_bytes is not None else {}
+        
+        # Load feature importance
+        fi_bytes = download_model_file(model_collection, "feature_importance.csv")
+        fi_df = pd.read_csv(io.BytesIO(fi_bytes)) if fi_bytes is not None else pd.DataFrame()
+        
+        client.close()
+        
+        if models:
+            logger.info("Successfully loaded all models from MongoDB Atlas Cloud!")
+            return models, metadata, fi_df, "cloud"
+        else:
+            raise FileNotFoundError("No models found in MongoDB Atlas cloud collection.")
+            
+    except Exception as exc:
+        logger.warning("Failed to load models from MongoDB Atlas Cloud (%s). Falling back to local files...", exc)
+
+    # ── 2. Fallback: Load from local file system ──
+    model_dir = "models"
+    try:
         models = {}
         for target_col in TARGET_COLS:
             model_path = os.path.join(model_dir, f"model_{target_col}.joblib")
@@ -272,22 +320,21 @@ def load_local_models():
                     "features": joblib.load(features_path) if os.path.exists(features_path) else None,
                 }
 
-        # Load metadata
         metadata_path = os.path.join(model_dir, "metadata.joblib")
         metadata = joblib.load(metadata_path) if os.path.exists(metadata_path) else {}
 
-        # Load feature importance
         fi_path = os.path.join(model_dir, "feature_importance.csv")
         fi_df = pd.read_csv(fi_path) if os.path.exists(fi_path) else pd.DataFrame()
 
         if not models:
             raise FileNotFoundError("No trained models found in local models/ folder.")
 
-        return models, metadata, fi_df
+        logger.info("Successfully loaded models from local fallback storage.")
+        return models, metadata, fi_df, "local"
 
-    except Exception as exc:
-        logger.error("Failed to load local model artifacts: %s", exc)
-        return None, None, pd.DataFrame()
+    except Exception as local_exc:
+        logger.error("Failed to load local model artifacts: %s", local_exc)
+        return None, None, pd.DataFrame(), "none"
 
 
 @st.cache_data(ttl=1800, show_spinner="Fetching live data from Open-Meteo...")
@@ -511,7 +558,6 @@ def create_pollutant_chart(sub_indices: dict) -> go.Figure:
         marker=dict(
             color=colors,
             line=dict(width=0),
-            cornerradius=6,
         ),
         text=[f"{int(v)}" for v in values],
         textposition="outside",
@@ -540,28 +586,28 @@ def create_pollutant_chart(sub_indices: dict) -> go.Figure:
 
 
 # ---------------------------------------------------------------------------
-# Main Dashboard
+# EDA Data Loader
 # ---------------------------------------------------------------------------
 
-def main():
-    """Render the Streamlit dashboard."""
+@st.cache_data(ttl=3600, show_spinner="Loading historical dataset for EDA...")
+def load_eda_data():
+    """Load the full historical dataset for EDA from local CSV cache."""
+    csv_path = "data/karachi_aqi_features.csv"
+    if os.path.exists(csv_path):
+        df = pd.read_csv(csv_path)
+        # Convert timestamp from epoch ms back to datetime
+        if "timestamp" in df.columns:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", errors="coerce")
+        return df
+    return pd.DataFrame()
 
-    # ── Hero Header ──
-    st.markdown("""
-    <div class="hero-header">
-        <h1>🌬️ Karachi AQI Forecast</h1>
-        <p class="subtitle">Real-time Air Quality Monitoring & 3-Day Prediction for Karachi, Pakistan</p>
-    </div>
-    """, unsafe_allow_html=True)
 
-    # ── Load data ──
-    with st.spinner("Loading latest data..."):
-        live_df = load_live_data()
-        models, metadata, fi_df = load_local_models()
+# ---------------------------------------------------------------------------
+# Dashboard Tab
+# ---------------------------------------------------------------------------
 
-    if live_df.empty:
-        st.error("⚠️ Unable to fetch live data from Open-Meteo. Please try again later.")
-        return
+def render_dashboard(live_df, models, metadata, fi_df):
+    """Render the main forecast dashboard tab."""
 
     # ── Current AQI computation ──
     latest_row = live_df.iloc[-1]
@@ -720,8 +766,668 @@ def main():
             </div>
             """, unsafe_allow_html=True)
 
-    # ── Sidebar — Model Info ──
+
+# ---------------------------------------------------------------------------
+# EDA Tab
+# ---------------------------------------------------------------------------
+
+def render_eda():
+    """Render the Exploratory Data Analysis tab."""
+
+    st.markdown("""
+    <div class="glass-card" style="margin-bottom: 1.5rem;">
+        <h3 style="color: #00f5d4; margin: 0;">📊 Exploratory Data Analysis</h3>
+        <p style="color: rgba(255,255,255,0.5); margin-top: 0.3rem;">
+            Interactive exploration of the Karachi AQI historical dataset — distributions,
+            correlations, seasonal patterns, and more.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    eda_df = load_eda_data()
+
+    if eda_df.empty:
+        st.warning(
+            "⚠️ No historical dataset found at `data/karachi_aqi_features.csv`. "
+            "Run the backfill pipeline first: `python feature_pipeline.py --backfill`"
+        )
+        return
+
+    # ── EDA Sub-sections ──
+    eda_sections = st.tabs([
+        "📋 Overview",
+        "📊 Distributions",
+        "🔗 Correlations",
+        "📈 Time Series",
+        "🏷️ AQI Categories",
+        "🌡️ Seasonal Patterns",
+        "🧪 Pollutant Contributions",
+        "🔍 Outlier Detection",
+    ])
+
+    # Columns for analysis
+    pollutant_cols = ["pm2_5", "pm10", "no2", "so2", "o3", "co"]
+    weather_cols = ["temperature", "humidity", "wind_speed", "wind_direction", "pressure"]
+    available_pollutants = [c for c in pollutant_cols if c in eda_df.columns]
+    available_weather = [c for c in weather_cols if c in eda_df.columns]
+
+    # ── 1. Dataset Overview ──
+    with eda_sections[0]:
+        st.markdown("#### Dataset Summary")
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total Rows", f"{len(eda_df):,}")
+        m2.metric("Total Columns", f"{len(eda_df.columns)}")
+
+        if "timestamp" in eda_df.columns and eda_df["timestamp"].notna().any():
+            min_date = eda_df["timestamp"].min()
+            max_date = eda_df["timestamp"].max()
+            m3.metric("Date Range Start", min_date.strftime("%Y-%m-%d") if hasattr(min_date, "strftime") else str(min_date)[:10])
+            m4.metric("Date Range End", max_date.strftime("%Y-%m-%d") if hasattr(max_date, "strftime") else str(max_date)[:10])
+
+        # Missing values heatmap
+        st.markdown("##### Missing Values")
+        core_cols = available_pollutants + available_weather + (["aqi"] if "aqi" in eda_df.columns else [])
+        if core_cols:
+            missing_pct = (eda_df[core_cols].isnull().sum() / len(eda_df) * 100).round(2)
+            missing_df = pd.DataFrame({"Column": missing_pct.index, "Missing %": missing_pct.values})
+
+            fig_missing = go.Figure(go.Bar(
+                x=missing_df["Column"],
+                y=missing_df["Missing %"],
+                marker=dict(
+                    color=["#ff6b6b" if v > 5 else "#00f5d4" for v in missing_df["Missing %"]],
+                ),
+                text=[f"{v:.1f}%" for v in missing_df["Missing %"]],
+                textposition="outside",
+                textfont=dict(color="white", size=11),
+            ))
+            fig_missing.update_layout(
+                template="plotly_dark",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                margin=dict(l=20, r=20, t=30, b=20),
+                height=300,
+                xaxis=dict(title=""),
+                yaxis=dict(title="Missing %", gridcolor="rgba(255,255,255,0.05)"),
+                showlegend=False,
+            )
+            st.plotly_chart(fig_missing, use_container_width=True, config={"displayModeBar": False})
+
+        # Descriptive statistics
+        st.markdown("##### Descriptive Statistics")
+        stats_cols = available_pollutants + available_weather + (["aqi"] if "aqi" in eda_df.columns else [])
+        if stats_cols:
+            st.dataframe(
+                eda_df[stats_cols].describe().round(2).T.style.format("{:.2f}"),
+                use_container_width=True,
+            )
+
+    # ── 2. Distributions ──
+    with eda_sections[1]:
+        st.markdown("#### Pollutant & Weather Distributions")
+
+        dist_col_select = st.multiselect(
+            "Select variables to plot",
+            options=available_pollutants + available_weather + (["aqi"] if "aqi" in eda_df.columns else []),
+            default=available_pollutants[:4] + (["aqi"] if "aqi" in eda_df.columns else []),
+            key="eda_dist_select",
+        )
+
+        if dist_col_select:
+            n_cols = min(3, len(dist_col_select))
+            from plotly.subplots import make_subplots
+            n_rows = (len(dist_col_select) + n_cols - 1) // n_cols
+
+            fig_dist = make_subplots(
+                rows=n_rows, cols=n_cols,
+                subplot_titles=dist_col_select,
+                horizontal_spacing=0.08,
+                vertical_spacing=0.12,
+            )
+
+            colors = ["#00f5d4", "#00bbf9", "#9b5de5", "#f15bb5", "#fee440", "#ff6b6b"]
+
+            for i, col_name in enumerate(dist_col_select):
+                row = i // n_cols + 1
+                col = i % n_cols + 1
+                data = eda_df[col_name].dropna()
+
+                fig_dist.add_trace(
+                    go.Histogram(
+                        x=data,
+                        nbinsx=50,
+                        marker=dict(color=colors[i % len(colors)], opacity=0.7),
+                        name=col_name,
+                        showlegend=False,
+                    ),
+                    row=row, col=col,
+                )
+
+            fig_dist.update_layout(
+                template="plotly_dark",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                margin=dict(l=20, r=20, t=40, b=20),
+                height=300 * n_rows,
+                showlegend=False,
+            )
+            fig_dist.update_xaxes(gridcolor="rgba(255,255,255,0.05)")
+            fig_dist.update_yaxes(gridcolor="rgba(255,255,255,0.05)")
+            st.plotly_chart(fig_dist, use_container_width=True, config={"displayModeBar": False})
+
+    # ── 3. Correlations ──
+    with eda_sections[2]:
+        st.markdown("#### Correlation Matrix")
+
+        corr_cols = available_pollutants + available_weather + (["aqi"] if "aqi" in eda_df.columns else [])
+        if len(corr_cols) >= 2:
+            corr_matrix = eda_df[corr_cols].corr().round(3)
+
+            fig_corr = go.Figure(go.Heatmap(
+                z=corr_matrix.values,
+                x=corr_matrix.columns,
+                y=corr_matrix.columns,
+                colorscale=[
+                    [0.0, "#7e0023"],
+                    [0.25, "#ff6b6b"],
+                    [0.5, "#1a1f2e"],
+                    [0.75, "#00bbf9"],
+                    [1.0, "#00f5d4"],
+                ],
+                zmin=-1, zmax=1,
+                text=corr_matrix.values.round(2),
+                texttemplate="%{text}",
+                textfont=dict(size=10, color="white"),
+                hovertemplate="<b>%{x}</b> vs <b>%{y}</b><br>Correlation: %{z:.3f}<extra></extra>",
+            ))
+
+            fig_corr.update_layout(
+                template="plotly_dark",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                margin=dict(l=20, r=20, t=30, b=20),
+                height=500,
+                xaxis=dict(side="bottom"),
+            )
+            st.plotly_chart(fig_corr, use_container_width=True, config={"displayModeBar": False})
+
+            # Top correlations with AQI
+            if "aqi" in corr_cols:
+                st.markdown("##### Strongest Correlations with AQI")
+                aqi_corrs = corr_matrix["aqi"].drop("aqi").abs().sort_values(ascending=False).head(10)
+                aqi_corrs_df = pd.DataFrame({
+                    "Feature": aqi_corrs.index,
+                    "Abs Correlation": aqi_corrs.values,
+                    "Direction": [
+                        "Positive ↑" if corr_matrix["aqi"][f] > 0 else "Negative ↓"
+                        for f in aqi_corrs.index
+                    ],
+                })
+
+                fig_aqi_corr = go.Figure(go.Bar(
+                    x=aqi_corrs_df["Abs Correlation"],
+                    y=aqi_corrs_df["Feature"],
+                    orientation="h",
+                    marker=dict(
+                        color=[
+                            "#00f5d4" if corr_matrix["aqi"][f] > 0 else "#ff6b6b"
+                            for f in aqi_corrs_df["Feature"]
+                        ],
+                    ),
+                    text=[f"{v:.3f}" for v in aqi_corrs_df["Abs Correlation"]],
+                    textposition="outside",
+                    textfont=dict(color="white", size=11),
+                ))
+                fig_aqi_corr.update_layout(
+                    template="plotly_dark",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    margin=dict(l=20, r=60, t=20, b=20),
+                    height=350,
+                    yaxis=dict(autorange="reversed"),
+                    xaxis=dict(title="|Correlation|", gridcolor="rgba(255,255,255,0.05)"),
+                    showlegend=False,
+                )
+                st.plotly_chart(fig_aqi_corr, use_container_width=True, config={"displayModeBar": False})
+
+    # ── 4. Time Series ──
+    with eda_sections[3]:
+        st.markdown("#### Time Series Trends")
+
+        if "timestamp" in eda_df.columns:
+            ts_vars = st.multiselect(
+                "Select variables to plot over time",
+                options=available_pollutants + (["aqi"] if "aqi" in eda_df.columns else []) + available_weather,
+                default=["aqi"] if "aqi" in eda_df.columns else available_pollutants[:2],
+                key="eda_ts_select",
+            )
+
+            agg_option = st.radio(
+                "Aggregation", ["Hourly (raw)", "Daily Mean", "Weekly Mean", "Monthly Mean"],
+                horizontal=True, key="eda_ts_agg",
+            )
+
+            if ts_vars:
+                ts_data = eda_df[["timestamp"] + ts_vars].copy()
+                ts_data = ts_data.dropna(subset=["timestamp"])
+                ts_data = ts_data.sort_values("timestamp")
+
+                if agg_option == "Daily Mean":
+                    ts_data = ts_data.set_index("timestamp").resample("D").mean().reset_index()
+                elif agg_option == "Weekly Mean":
+                    ts_data = ts_data.set_index("timestamp").resample("W").mean().reset_index()
+                elif agg_option == "Monthly Mean":
+                    ts_data = ts_data.set_index("timestamp").resample("ME").mean().reset_index()
+
+                colors_ts = ["#00f5d4", "#00bbf9", "#9b5de5", "#f15bb5", "#fee440", "#ff6b6b"]
+                fig_ts = go.Figure()
+
+                for i, var in enumerate(ts_vars):
+                    fig_ts.add_trace(go.Scatter(
+                        x=ts_data["timestamp"],
+                        y=ts_data[var],
+                        mode="lines",
+                        name=var,
+                        line=dict(color=colors_ts[i % len(colors_ts)], width=1.5),
+                    ))
+
+                fig_ts.update_layout(
+                    template="plotly_dark",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    margin=dict(l=20, r=20, t=30, b=20),
+                    height=450,
+                    xaxis=dict(title="", gridcolor="rgba(255,255,255,0.05)"),
+                    yaxis=dict(title="Value", gridcolor="rgba(255,255,255,0.05)"),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    hovermode="x unified",
+                )
+                st.plotly_chart(fig_ts, use_container_width=True, config={"displayModeBar": False})
+
+    # ── 5. AQI Category Distribution ──
+    with eda_sections[4]:
+        st.markdown("#### AQI Category Distribution")
+
+        if "aqi" in eda_df.columns:
+            aqi_data = eda_df["aqi"].dropna()
+
+            # Assign categories
+            cat_labels = []
+            cat_colors_list = []
+            for val in aqi_data:
+                cat = get_aqi_category(val)
+                cat_labels.append(cat["label"])
+                cat_colors_list.append(cat["color"])
+
+            cat_counts = pd.Series(cat_labels).value_counts()
+
+            # Pie + Bar side by side
+            pie_col, bar_col = st.columns(2)
+
+            with pie_col:
+                cat_color_map = {cat["label"]: cat["color"] for cat in AQI_CATEGORIES}
+                fig_pie = go.Figure(go.Pie(
+                    labels=cat_counts.index,
+                    values=cat_counts.values,
+                    marker=dict(colors=[cat_color_map.get(c, "#666") for c in cat_counts.index]),
+                    hole=0.45,
+                    textinfo="label+percent",
+                    textfont=dict(size=11),
+                    hovertemplate="<b>%{label}</b><br>Count: %{value:,}<br>%{percent}<extra></extra>",
+                ))
+                fig_pie.update_layout(
+                    template="plotly_dark",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    margin=dict(l=20, r=20, t=30, b=20),
+                    height=400,
+                    showlegend=False,
+                    title=dict(text="Category Breakdown", font=dict(size=14, color="rgba(255,255,255,0.7)")),
+                )
+                st.plotly_chart(fig_pie, use_container_width=True, config={"displayModeBar": False})
+
+            with bar_col:
+                fig_bar_cat = go.Figure(go.Bar(
+                    x=cat_counts.index,
+                    y=cat_counts.values,
+                    marker=dict(
+                        color=[cat_color_map.get(c, "#666") for c in cat_counts.index],
+                    ),
+                    text=[f"{v:,}" for v in cat_counts.values],
+                    textposition="outside",
+                    textfont=dict(color="white", size=11),
+                ))
+                fig_bar_cat.update_layout(
+                    template="plotly_dark",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    margin=dict(l=20, r=20, t=30, b=20),
+                    height=400,
+                    xaxis=dict(title=""),
+                    yaxis=dict(title="Count", gridcolor="rgba(255,255,255,0.05)"),
+                    showlegend=False,
+                    title=dict(text="Category Counts", font=dict(size=14, color="rgba(255,255,255,0.7)")),
+                )
+                st.plotly_chart(fig_bar_cat, use_container_width=True, config={"displayModeBar": False})
+        else:
+            st.info("AQI column not found in dataset.")
+
+    # ── 6. Seasonal Patterns ──
+    with eda_sections[5]:
+        st.markdown("#### Seasonal & Temporal Patterns")
+
+        if "aqi" in eda_df.columns:
+            season_col1, season_col2 = st.columns(2)
+
+            # AQI by Hour of Day
+            with season_col1:
+                if "hour" in eda_df.columns:
+                    hourly_stats = eda_df.groupby("hour")["aqi"].agg(["mean", "median", "std"]).reset_index()
+
+                    fig_hour = go.Figure()
+                    fig_hour.add_trace(go.Scatter(
+                        x=hourly_stats["hour"],
+                        y=hourly_stats["mean"],
+                        mode="lines+markers",
+                        name="Mean AQI",
+                        line=dict(color="#00f5d4", width=2.5),
+                        marker=dict(size=8),
+                    ))
+                    fig_hour.add_trace(go.Scatter(
+                        x=hourly_stats["hour"],
+                        y=hourly_stats["median"],
+                        mode="lines+markers",
+                        name="Median AQI",
+                        line=dict(color="#00bbf9", width=2, dash="dash"),
+                        marker=dict(size=6),
+                    ))
+                    # Std deviation band
+                    fig_hour.add_trace(go.Scatter(
+                        x=list(hourly_stats["hour"]) + list(hourly_stats["hour"][::-1]),
+                        y=list(hourly_stats["mean"] + hourly_stats["std"]) + list((hourly_stats["mean"] - hourly_stats["std"])[::-1]),
+                        fill="toself",
+                        fillcolor="rgba(0,245,212,0.08)",
+                        line=dict(color="rgba(0,0,0,0)"),
+                        showlegend=False,
+                        hoverinfo="skip",
+                    ))
+
+                    fig_hour.update_layout(
+                        template="plotly_dark",
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        margin=dict(l=20, r=20, t=40, b=20),
+                        height=380,
+                        title=dict(text="AQI by Hour of Day", font=dict(size=14, color="rgba(255,255,255,0.7)")),
+                        xaxis=dict(title="Hour", dtick=2, gridcolor="rgba(255,255,255,0.05)"),
+                        yaxis=dict(title="AQI", gridcolor="rgba(255,255,255,0.05)"),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10)),
+                    )
+                    st.plotly_chart(fig_hour, use_container_width=True, config={"displayModeBar": False})
+
+            # AQI by Month
+            with season_col2:
+                if "month" in eda_df.columns:
+                    month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+                    monthly_stats = eda_df.groupby("month")["aqi"].agg(["mean", "median", "std"]).reset_index()
+
+                    fig_month = go.Figure()
+                    fig_month.add_trace(go.Bar(
+                        x=[month_names[int(m)-1] if 1 <= m <= 12 else str(m) for m in monthly_stats["month"]],
+                        y=monthly_stats["mean"],
+                        marker=dict(
+                            color=monthly_stats["mean"],
+                            colorscale=[[0, "#00f5d4"], [0.5, "#fee440"], [1, "#ff6b6b"]],
+                        ),
+                        text=[f"{v:.0f}" for v in monthly_stats["mean"]],
+                        textposition="outside",
+                        textfont=dict(color="white", size=10),
+                        error_y=dict(
+                            type="data",
+                            array=monthly_stats["std"].fillna(0).values,
+                            visible=True,
+                            color="rgba(255,255,255,0.3)",
+                        ),
+                    ))
+
+                    fig_month.update_layout(
+                        template="plotly_dark",
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        margin=dict(l=20, r=20, t=40, b=20),
+                        height=380,
+                        title=dict(text="Mean AQI by Month", font=dict(size=14, color="rgba(255,255,255,0.7)")),
+                        xaxis=dict(title=""),
+                        yaxis=dict(title="AQI", gridcolor="rgba(255,255,255,0.05)"),
+                        showlegend=False,
+                    )
+                    st.plotly_chart(fig_month, use_container_width=True, config={"displayModeBar": False})
+
+            # AQI by Day of Week
+            if "day_of_week" in eda_df.columns:
+                st.markdown("##### AQI by Day of Week")
+                dow_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+                dow_data = eda_df.groupby("day_of_week")["aqi"].agg(["mean", "std"]).reset_index()
+
+                fig_dow = go.Figure(go.Bar(
+                    x=[dow_names[int(d)] if 0 <= d <= 6 else str(d) for d in dow_data["day_of_week"]],
+                    y=dow_data["mean"],
+                    marker=dict(
+                        color=["#9b5de5" if d >= 5 else "#00bbf9" for d in dow_data["day_of_week"]],
+                    ),
+                    text=[f"{v:.0f}" for v in dow_data["mean"]],
+                    textposition="outside",
+                    textfont=dict(color="white", size=11),
+                    error_y=dict(
+                        type="data",
+                        array=dow_data["std"].fillna(0).values,
+                        visible=True,
+                        color="rgba(255,255,255,0.3)",
+                    ),
+                ))
+                fig_dow.update_layout(
+                    template="plotly_dark",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    margin=dict(l=20, r=20, t=20, b=20),
+                    height=320,
+                    xaxis=dict(title=""),
+                    yaxis=dict(title="Mean AQI", gridcolor="rgba(255,255,255,0.05)"),
+                    showlegend=False,
+                )
+                st.plotly_chart(fig_dow, use_container_width=True, config={"displayModeBar": False})
+
+    # ── 7. Pollutant Contributions ──
+    with eda_sections[6]:
+        st.markdown("#### Pollutant Concentration Trends")
+
+        if "timestamp" in eda_df.columns and available_pollutants:
+            # Stacked area chart of pollutant concentrations over time (daily mean)
+            poll_ts = eda_df[["timestamp"] + available_pollutants].copy()
+            poll_ts = poll_ts.dropna(subset=["timestamp"])
+            poll_ts = poll_ts.set_index("timestamp").resample("D").mean().reset_index()
+
+            colors_poll = ["#00f5d4", "#00bbf9", "#9b5de5", "#f15bb5", "#fee440", "#ff6b6b"]
+            # rgba fill equivalents (hex "40" suffix ≈ 0.25 opacity) — rgba() required for older Plotly
+            colors_poll_fill = [
+                "rgba(0,245,212,0.25)",
+                "rgba(0,187,249,0.25)",
+                "rgba(155,93,229,0.25)",
+                "rgba(241,91,181,0.25)",
+                "rgba(254,228,64,0.25)",
+                "rgba(255,107,107,0.25)",
+            ]
+            fig_stack = go.Figure()
+
+            for i, pol in enumerate(available_pollutants):
+                fig_stack.add_trace(go.Scatter(
+                    x=poll_ts["timestamp"],
+                    y=poll_ts[pol],
+                    mode="lines",
+                    name=pol.upper(),
+                    line=dict(width=0.5, color=colors_poll[i % len(colors_poll)]),
+                    stackgroup="one",
+                    fillcolor=colors_poll_fill[i % len(colors_poll_fill)],
+                ))
+
+            fig_stack.update_layout(
+                template="plotly_dark",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                margin=dict(l=20, r=20, t=30, b=20),
+                height=450,
+                xaxis=dict(title="", gridcolor="rgba(255,255,255,0.05)"),
+                yaxis=dict(title="Concentration (µg/m³)", gridcolor="rgba(255,255,255,0.05)"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                hovermode="x unified",
+                title=dict(text="Daily Mean Pollutant Concentrations (Stacked)", font=dict(size=14, color="rgba(255,255,255,0.7)")),
+            )
+            st.plotly_chart(fig_stack, use_container_width=True, config={"displayModeBar": False})
+
+            # Individual pollutant box plots
+            st.markdown("##### Pollutant Concentration Box Plots")
+            from plotly.subplots import make_subplots
+
+            fig_box_poll = make_subplots(
+                rows=1, cols=len(available_pollutants),
+                subplot_titles=[p.upper() for p in available_pollutants],
+                horizontal_spacing=0.05,
+            )
+
+            for i, pol in enumerate(available_pollutants):
+                fig_box_poll.add_trace(
+                    go.Box(
+                        y=eda_df[pol].dropna(),
+                        marker=dict(color=colors_poll[i % len(colors_poll)]),
+                        boxmean="sd",
+                        name=pol.upper(),
+                        showlegend=False,
+                    ),
+                    row=1, col=i + 1,
+                )
+
+            fig_box_poll.update_layout(
+                template="plotly_dark",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                margin=dict(l=20, r=20, t=40, b=20),
+                height=350,
+            )
+            fig_box_poll.update_yaxes(gridcolor="rgba(255,255,255,0.05)")
+            st.plotly_chart(fig_box_poll, use_container_width=True, config={"displayModeBar": False})
+
+    # ── 8. Outlier Detection ──
+    with eda_sections[7]:
+        st.markdown("#### Outlier Detection (IQR Method)")
+
+        outlier_var = st.selectbox(
+            "Select variable for outlier analysis",
+            options=available_pollutants + (["aqi"] if "aqi" in eda_df.columns else []) + available_weather,
+            key="eda_outlier_select",
+        )
+
+        if outlier_var:
+            data = eda_df[outlier_var].dropna()
+            Q1 = data.quantile(0.25)
+            Q3 = data.quantile(0.75)
+            IQR = Q3 - Q1
+            lower_bound = Q1 - 1.5 * IQR
+            upper_bound = Q3 + 1.5 * IQR
+
+            outliers = data[(data < lower_bound) | (data > upper_bound)]
+
+            # Metrics
+            o1, o2, o3, o4 = st.columns(4)
+            o1.metric("Total Values", f"{len(data):,}")
+            o2.metric("Outliers Found", f"{len(outliers):,}")
+            o3.metric("Outlier %", f"{len(outliers)/len(data)*100:.2f}%")
+            o4.metric("IQR", f"{IQR:.2f}")
+
+            # Box plot + scatter of outliers
+            out_col1, out_col2 = st.columns([1, 2])
+
+            with out_col1:
+                fig_box = go.Figure(go.Box(
+                    y=data,
+                    marker=dict(color="#00f5d4"),
+                    boxmean="sd",
+                    name=outlier_var,
+                ))
+                fig_box.add_hline(y=upper_bound, line_dash="dash", line_color="#ff6b6b", opacity=0.6,
+                                  annotation_text=f"Upper: {upper_bound:.1f}", annotation_font_color="#ff6b6b")
+                fig_box.add_hline(y=lower_bound, line_dash="dash", line_color="#ff6b6b", opacity=0.6,
+                                  annotation_text=f"Lower: {lower_bound:.1f}", annotation_font_color="#ff6b6b")
+                fig_box.update_layout(
+                    template="plotly_dark",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    margin=dict(l=20, r=20, t=20, b=20),
+                    height=400,
+                    yaxis=dict(gridcolor="rgba(255,255,255,0.05)"),
+                    showlegend=False,
+                )
+                st.plotly_chart(fig_box, use_container_width=True, config={"displayModeBar": False})
+
+            with out_col2:
+                if "timestamp" in eda_df.columns:
+                    outlier_df = eda_df[["timestamp", outlier_var]].dropna()
+                    is_outlier = (outlier_df[outlier_var] < lower_bound) | (outlier_df[outlier_var] > upper_bound)
+
+                    fig_scatter = go.Figure()
+                    # Normal points
+                    normal = outlier_df[~is_outlier]
+                    fig_scatter.add_trace(go.Scatter(
+                        x=normal["timestamp"],
+                        y=normal[outlier_var],
+                        mode="markers",
+                        name="Normal",
+                        marker=dict(color="rgba(0,187,249,0.3)", size=3),
+                    ))
+                    # Outlier points
+                    outlier_pts = outlier_df[is_outlier]
+                    fig_scatter.add_trace(go.Scatter(
+                        x=outlier_pts["timestamp"],
+                        y=outlier_pts[outlier_var],
+                        mode="markers",
+                        name="Outlier",
+                        marker=dict(color="#ff6b6b", size=5, symbol="x"),
+                    ))
+                    fig_scatter.add_hline(y=upper_bound, line_dash="dot", line_color="#ff6b6b", opacity=0.4)
+                    fig_scatter.add_hline(y=lower_bound, line_dash="dot", line_color="#ff6b6b", opacity=0.4)
+
+                    fig_scatter.update_layout(
+                        template="plotly_dark",
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        margin=dict(l=20, r=20, t=20, b=20),
+                        height=400,
+                        xaxis=dict(title="", gridcolor="rgba(255,255,255,0.05)"),
+                        yaxis=dict(title=outlier_var, gridcolor="rgba(255,255,255,0.05)"),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10)),
+                    )
+                    st.plotly_chart(fig_scatter, use_container_width=True, config={"displayModeBar": False})
+
+
+# ---------------------------------------------------------------------------
+# Sidebar (shared across tabs)
+# ---------------------------------------------------------------------------
+
+def render_sidebar(metadata, fi_df, load_source: str):
+    """Render the sidebar with model info, cloud status, and controls."""
     with st.sidebar:
+        # ── Cloud Storage Indicator ──
+        st.markdown("### ☁️ Cloud Storage")
+        st.caption("MongoDB Atlas")
+
+        if load_source == "cloud":
+            st.success("Models: ☁️ Cloud (MongoDB Atlas)")
+        elif load_source == "local":
+            st.warning("Models: 📂 Local Fallback")
+        else:
+            st.error("Models: Missing / Error")
+
         st.markdown("## 🤖 Model Information")
 
         if metadata:
@@ -775,7 +1481,6 @@ def main():
                     orientation="h",
                     marker=dict(
                         color="rgba(0,245,212,0.7)",
-                        cornerradius=4,
                     ),
                 ))
                 fig_fi.update_layout(
@@ -805,5 +1510,43 @@ def main():
         """, unsafe_allow_html=True)
 
 
+# ---------------------------------------------------------------------------
+# Main Application Entry Point
+# ---------------------------------------------------------------------------
+
+def main():
+    """Render the Streamlit dashboard with tabbed navigation."""
+
+    # ── Hero Header ──
+    st.markdown("""
+    <div class="hero-header">
+        <h1>🌬️ Karachi AQI Forecast</h1>
+        <p class="subtitle">Real-time Air Quality Monitoring & 3-Day Prediction for Karachi, Pakistan</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Load data ──
+    with st.spinner("Loading latest data..."):
+        live_df = load_live_data()
+        models, metadata, fi_df, load_source = load_models()
+
+    # ── Sidebar (always visible) ──
+    render_sidebar(metadata, fi_df, load_source)
+
+    if live_df.empty:
+        st.error("⚠️ Unable to fetch live data from Open-Meteo. Please try again later.")
+        return
+
+    # ── Tabbed Navigation ──
+    tab_dashboard, tab_eda = st.tabs(["🏠 Dashboard", "📊 Exploratory Data Analysis"])
+
+    with tab_dashboard:
+        render_dashboard(live_df, models, metadata, fi_df)
+
+    with tab_eda:
+        render_eda()
+
+
 if __name__ == "__main__":
     main()
+

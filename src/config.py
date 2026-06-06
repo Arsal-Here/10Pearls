@@ -28,6 +28,9 @@ MONGODB_DATABASE = _get_clean_env("MONGODB_DATABASE") or "karachi_aqi"
 MONGODB_FEATURE_COLLECTION = (
     _get_clean_env("MONGODB_FEATURE_COLLECTION") or "karachi_aqi_features"
 )
+MONGODB_MODEL_COLLECTION = (
+    _get_clean_env("MONGODB_MODEL_COLLECTION") or "karachi_aqi_models"
+)
 
 
 MODEL_NAME = "karachi_aqi_model"
@@ -95,6 +98,25 @@ EVENT_TIME = "timestamp"
 ROLLING_WINDOWS = [6, 12, 24]       # hours
 LAG_STEPS = [1, 3, 6, 12, 24]       # hours
 CHANGE_RATE_WINDOWS = [3, 6, 12]    # hours
+EWMA_SPANS = [6, 12, 24]            # hours — for exponential weighted moving averages
+
+# Pollutant × weather interaction pairs for cross-feature engineering
+INTERACTION_PAIRS = [
+    ("pm2_5", "humidity"),
+    ("pm2_5", "wind_speed"),
+    ("pm2_5", "pressure"),
+    ("pm10", "temperature"),
+    ("pm10", "wind_speed"),
+    ("pm10", "humidity"),
+]
+
+# Day segments for coarse time-of-day encoding
+DAY_SEGMENTS = {
+    "night": (0, 6),       # 00:00 – 05:59
+    "morning": (6, 12),    # 06:00 – 11:59
+    "afternoon": (12, 18), # 12:00 – 17:59
+    "evening": (18, 24),   # 18:00 – 23:59
+}
 
 # =============================================================================
 # Backfill Configuration
